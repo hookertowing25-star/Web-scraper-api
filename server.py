@@ -1,29 +1,33 @@
-from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
-from pathlib import Path
+import re
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime
 import httpx
 from bs4 import BeautifulSoup
-import base64
 from urllib.parse import urljoin, urlparse
+import json
 
 load_dotenv()
 
+# Environment variables
 MONGO_URL = os.getenv('MONGO_URL', 'mongodb://localhost:27017')
 DB_NAME = os.getenv('DB_NAME', 'webscraper')
+BROWSERLESS_API_KEY = os.getenv('BROWSERLESS_API_KEY', '2Tthi4OMNonpB1T45eabd9db6951daffd987e750e5678050f')
+BROWSERLESS_URL = f"https://chrome.browserless.io"
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-app = FastAPI(title="Web Scraper API", version="2.0.0")
+app = FastAPI(title="Marketing Scraper API", version="3.0.0")
 api_router = APIRouter(prefix="/api")
 
 app.add_middleware(
@@ -34,268 +38,615 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class ScrapeMode(BaseModel):
-    html: bool = True
-    css: bool = True
-    images: bool = True
-    links: bool = True
-    scripts: bool = False
-    text_only: bool = False
+# ========== MODELS ==========
 
-class ScrapedPage(BaseModel):
-    page_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+class ScrapeOptions(BaseModel):
+    # Lead Scraper Options
+    extract_emails: bool = True
+    extract_phones: bool = True
+    extract_names: bool = True
+    extract_companies: bool = True
+    extract_social_links: bool = True
+    
+    # Site Cloner Options
+    extract_html: bool = True
+    extract_css: bool = True
+    extract_images: bool = True
+    extract_links: bool = True
+    
+    # Video Grabber Options
+    extract_youtube: bool = True
+    extract_vimeo: bool = True
+    extract_all_videos: bool = True
+
+class ScrapeRequest(BaseModel):
     url: str
-    title: Optional[str] = None
-    html: Optional[str] = None
-    css: Optional[str] = None
-    text: Optional[str] = None
-    images: List[Dict[str, str]] = []
-    links: List[str] = []
-    scripts: List[str] = []
-    scraped_at: datetime = Field(default_factory=datetime.utcnow)
-    mode: Dict[str, bool] = {}
+    options: ScrapeOptions = ScrapeOptions()
+    session_id: Optional[str] = None
 
-class ScrapeSession(BaseModel):
-    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+class SessionRequest(BaseModel):
     name: Optional[str] = None
-    pages: List[ScrapedPage] = []
-    total_pages: int = 0
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-    completed_at: Optional[datetime] = None
-    status: str = "active"
-    webhook_url: Optional[str] = None
-    webhook_sent: bool = False
-
-class StartSessionRequest(BaseModel):
-    name: Optional[str] = None
-    webhook_url: Optional[str] = None
-
-class ScrapePageRequest(BaseModel):
-    session_id: str
-    url: str
-    mode: ScrapeMode = ScrapeMode()
 
 class CompleteSessionRequest(BaseModel):
     session_id: str
     webhook_url: Optional[str] = None
 
-class WebScrapeRequest(BaseModel):
-    url: str
-    mode: ScrapeMode = ScrapeMode()
+# ========== EXTRACTION FUNCTIONS ==========
 
-async def scrape_url(url: str, mode: ScrapeMode) -> Dict[str, Any]:
+def extract_emails(text: str, html: str) -> List[str]:
+    """Extract email addresses"""
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    emails = set(re.findall(email_pattern, text))
+    emails.update(re.findall(email_pattern, html))
+    # Filter out common false positives
+    filtered = [e for e in emails if not any(x in e.lower() for x in ['example.com', 'test.com', 'email.com', '.png', '.jpg', '.gif'])]
+    return list(filtered)[:50]  # Limit to 50
+
+def extract_phones(text: str) -> List[str]:
+    """Extract phone numbers"""
+    patterns = [
+        r'\+?1?\s*\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}',
+        r'\+?[0-9]{1,3}[-.\s]?[0-9]{3,4}[-.\s]?[0-9]{3,4}[-.\s]?[0-9]{3,4}',
+        r'\([0-9]{3}\)\s*[0-9]{3}[-.\s]?[0-9]{4}',
+    ]
+    phones = set()
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        phones.update(matches)
+    return list(phones)[:30]
+
+def extract_names(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    """Extract potential names from common patterns"""
+    names = []
+    
+    # Look for common name containers
+    name_selectors = [
+        'h1', 'h2', 'h3',
+        '[class*="name"]', '[class*="author"]', '[class*="contact"]',
+        '[class*="team"]', '[class*="staff"]', '[class*="person"]',
+        '[itemprop="name"]', '[data-name]'
+    ]
+    
+    for selector in name_selectors:
+        elements = soup.select(selector)
+        for el in elements[:20]:
+            text = el.get_text(strip=True)
+            # Filter to likely names (2-4 words, reasonable length)
+            if text and 3 < len(text) < 50 and 1 <= text.count(' ') <= 3:
+                if not any(char.isdigit() for char in text):
+                    names.append({'name': text, 'source': selector})
+    
+    return names[:20]
+
+def extract_companies(soup: BeautifulSoup, text: str) -> List[str]:
+    """Extract company names"""
+    companies = set()
+    
+    # Look for common company indicators
+    company_selectors = [
+        '[class*="company"]', '[class*="business"]', '[class*="organization"]',
+        '[itemprop="organization"]', '[class*="brand"]'
+    ]
+    
+    for selector in company_selectors:
+        elements = soup.select(selector)
+        for el in elements[:10]:
+            name = el.get_text(strip=True)
+            if name and 2 < len(name) < 100:
+                companies.add(name)
+    
+    # Look for LLC, Inc, Corp, etc.
+    corp_pattern = r'([A-Z][A-Za-z\s&]+(?:LLC|Inc|Corp|Ltd|Company|Co\.|Limited)\.?)'
+    matches = re.findall(corp_pattern, text)
+    companies.update(matches[:10])
+    
+    return list(companies)[:15]
+
+def extract_social_links(soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
+    """Extract social media links"""
+    social_platforms = {
+        'facebook.com': 'Facebook',
+        'twitter.com': 'Twitter',
+        'x.com': 'Twitter/X',
+        'linkedin.com': 'LinkedIn',
+        'instagram.com': 'Instagram',
+        'youtube.com': 'YouTube',
+        'tiktok.com': 'TikTok',
+        'pinterest.com': 'Pinterest',
+        'github.com': 'GitHub',
+    }
+    
+    social_links = []
+    for a_tag in soup.find_all('a', href=True):
+        href = a_tag['href']
+        for domain, platform in social_platforms.items():
+            if domain in href:
+                social_links.append({
+                    'platform': platform,
+                    'url': href
+                })
+                break
+    
+    # Remove duplicates
+    seen = set()
+    unique_links = []
+    for link in social_links:
+        if link['url'] not in seen:
+            seen.add(link['url'])
+            unique_links.append(link)
+    
+    return unique_links[:20]
+
+def extract_videos(soup: BeautifulSoup, html: str, options: ScrapeOptions) -> List[Dict[str, Any]]:
+    """Extract video URLs"""
+    videos = []
+    
+    # YouTube
+    if options.extract_youtube:
+        yt_patterns = [
+            r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})',
+        ]
+        for pattern in yt_patterns:
+            matches = re.findall(pattern, html)
+            for video_id in set(matches):
+                videos.append({
+                    'platform': 'YouTube',
+                    'video_id': video_id,
+                    'url': f'https://www.youtube.com/watch?v={video_id}',
+                    'embed_url': f'https://www.youtube.com/embed/{video_id}'
+                })
+    
+    # Vimeo
+    if options.extract_vimeo:
+        vimeo_patterns = [
+            r'vimeo\.com/(\d+)',
+            r'player\.vimeo\.com/video/(\d+)'
+        ]
+        for pattern in vimeo_patterns:
+            matches = re.findall(pattern, html)
+            for video_id in set(matches):
+                videos.append({
+                    'platform': 'Vimeo',
+                    'video_id': video_id,
+                    'url': f'https://vimeo.com/{video_id}',
+                    'embed_url': f'https://player.vimeo.com/video/{video_id}'
+                })
+    
+    # Generic video tags
+    if options.extract_all_videos:
+        for video_tag in soup.find_all('video'):
+            src = video_tag.get('src')
+            if src:
+                videos.append({
+                    'platform': 'Direct',
+                    'url': src,
+                    'type': 'video'
+                })
+            for source in video_tag.find_all('source'):
+                src = source.get('src')
+                if src:
+                    videos.append({
+                        'platform': 'Direct',
+                        'url': src,
+                        'type': source.get('type', 'video')
+                    })
+        
+        # Look for video in iframes
+        for iframe in soup.find_all('iframe'):
+            src = iframe.get('src', '')
+            if any(x in src for x in ['video', 'embed', 'player']):
+                videos.append({
+                    'platform': 'Embedded',
+                    'url': src,
+                    'type': 'iframe'
+                })
+    
+    return videos[:30]
+
+def extract_images(soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
+    """Extract all images"""
+    images = []
+    for img in soup.find_all('img'):
+        src = img.get('src', '') or img.get('data-src', '')
+        if src:
+            absolute_url = urljoin(base_url, src)
+            images.append({
+                'url': absolute_url,
+                'alt': img.get('alt', ''),
+                'width': img.get('width', ''),
+                'height': img.get('height', '')
+            })
+    
+    # Also get background images from style attributes
+    for el in soup.find_all(style=True):
+        style = el.get('style', '')
+        urls = re.findall(r'url\(["\']?([^"\')\s]+)["\']?\)', style)
+        for url in urls:
+            absolute_url = urljoin(base_url, url)
+            images.append({
+                'url': absolute_url,
+                'alt': 'background-image',
+                'type': 'background'
+            })
+    
+    return images[:100]
+
+def extract_css(soup: BeautifulSoup, base_url: str) -> Dict[str, Any]:
+    """Extract CSS"""
+    css_data = {
+        'inline_styles': [],
+        'external_stylesheets': [],
+        'total_css': ''
+    }
+    
+    # Inline styles
+    for style in soup.find_all('style'):
+        if style.string:
+            css_data['inline_styles'].append(style.string)
+    
+    # External stylesheets
+    for link in soup.find_all('link', rel='stylesheet'):
+        href = link.get('href')
+        if href:
+            absolute_url = urljoin(base_url, href)
+            css_data['external_stylesheets'].append(absolute_url)
+    
+    css_data['total_css'] = '\n\n'.join(css_data['inline_styles'])
+    
+    return css_data
+
+def extract_links(soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
+    """Extract all links"""
+    links = []
+    for a_tag in soup.find_all('a', href=True):
+        href = a_tag['href']
+        if href and not href.startswith('#') and not href.startswith('javascript:'):
+            absolute_url = urljoin(base_url, href)
+            links.append({
+                'url': absolute_url,
+                'text': a_tag.get_text(strip=True)[:100],
+                'is_external': urlparse(absolute_url).netloc != urlparse(base_url).netloc
+            })
+    return links[:200]
+
+# ========== BROWSERLESS SCRAPING ==========
+
+async def scrape_with_browserless(url: str) -> Dict[str, Any]:
+    """Scrape a URL using Browserless.io (handles JavaScript)"""
+    
+    # Use Browserless content API
+    browserless_endpoint = f"{BROWSERLESS_URL}/content?token={BROWSERLESS_API_KEY}"
+    
+    payload = {
+        "url": url,
+        "waitFor": 3000,  # Wait for JS to load
+        "gotoOptions": {
+            "waitUntil": "networkidle2"
+        }
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as http_client:
+            response = await http_client.post(
+                browserless_endpoint,
+                json=payload,
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            if response.status_code == 200:
+                return {
+                    'success': True,
+                    'html': response.text,
+                    'status_code': 200
+                }
+            else:
+                # Fallback to simple HTTP request
+                logging.warning(f"Browserless failed ({response.status_code}), falling back to simple request")
+                return await simple_scrape(url)
+                
+    except Exception as e:
+        logging.error(f"Browserless error: {str(e)}")
+        return await simple_scrape(url)
+
+async def simple_scrape(url: str) -> Dict[str, Any]:
+    """Simple HTTP scrape fallback"""
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http_client:
             response = await http_client.get(url, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             })
-            response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        result = {
-            'url': url,
-            'title': soup.title.string if soup.title else url,
-            'scraped_at': datetime.utcnow().isoformat(),
-            'mode': mode.dict()
-        }
-        if mode.html:
-            if mode.text_only:
-                result['text'] = soup.get_text(separator='\n', strip=True)
-            else:
-                result['html'] = str(soup)
-        if mode.css:
-            css = []
-            for style_tag in soup.find_all('style'):
-                if style_tag.string:
-                    css.append(style_tag.string)
-            for link_tag in soup.find_all('link', rel='stylesheet'):
-                href = link_tag.get('href')
-                if href:
-                    absolute_url = urljoin(url, href)
-                    css.append(f"/* External stylesheet: {absolute_url} */")
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as css_client:
-                            css_response = await css_client.get(absolute_url)
-                            if css_response.status_code == 200:
-                                css.append(css_response.text)
-                    except:
-                        pass
-            result['css'] = '\n\n'.join(css)
-        if mode.images:
-            images = []
-            for img in soup.find_all('img'):
-                img_src = img.get('src', '')
-                if img_src:
-                    absolute_url = urljoin(url, img_src)
-                    images.append({'url': absolute_url, 'alt': img.get('alt', ''), 'width': img.get('width', ''), 'height': img.get('height', '')})
-            result['images'] = images
-        if mode.links:
-            links = []
-            for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href']
-                if href and not href.startswith('#') and not href.startswith('javascript:'):
-                    absolute_url = urljoin(url, href)
-                    links.append({'url': absolute_url, 'text': a_tag.get_text(strip=True)[:100]})
-            result['links'] = links
-        if mode.scripts:
-            scripts = []
-            for script_tag in soup.find_all('script'):
-                if script_tag.get('src'):
-                    scripts.append({'type': 'external', 'url': urljoin(url, script_tag['src'])})
-                elif script_tag.string:
-                    scripts.append({'type': 'inline', 'content': script_tag.string[:500]})
-            result['scripts'] = scripts
-        return result
+            return {
+                'success': True,
+                'html': response.text,
+                'status_code': response.status_code
+            }
     except Exception as e:
-        logging.error(f"Error scraping {url}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to scrape URL: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+# ========== MAIN SCRAPE ENDPOINT ==========
+
+@api_router.post("/scrape")
+async def scrape_url(request: ScrapeRequest):
+    """Main scraping endpoint with all features"""
+    
+    url = request.url
+    options = request.options
+    
+    logging.info(f"Scraping {url} with options: {options.dict()}")
+    
+    # Scrape the page (try Browserless first for JS-heavy sites)
+    scrape_result = await scrape_with_browserless(url)
+    
+    if not scrape_result.get('success'):
+        raise HTTPException(status_code=500, detail=f"Failed to scrape: {scrape_result.get('error')}")
+    
+    html = scrape_result['html']
+    soup = BeautifulSoup(html, 'html.parser')
+    text = soup.get_text(separator=' ', strip=True)
+    
+    # Build response based on options
+    result = {
+        'url': url,
+        'title': soup.title.string if soup.title else url,
+        'scraped_at': datetime.utcnow().isoformat(),
+    }
+    
+    # Lead Scraper
+    leads = {}
+    if options.extract_emails:
+        leads['emails'] = extract_emails(text, html)
+    if options.extract_phones:
+        leads['phones'] = extract_phones(text)
+    if options.extract_names:
+        leads['names'] = extract_names(soup)
+    if options.extract_companies:
+        leads['companies'] = extract_companies(soup, text)
+    if options.extract_social_links:
+        leads['social_links'] = extract_social_links(soup, url)
+    
+    if leads:
+        result['leads'] = leads
+    
+    # Site Cloner
+    site_data = {}
+    if options.extract_html:
+        site_data['html'] = html
+        site_data['text'] = text[:10000]  # First 10k chars of text
+    if options.extract_css:
+        site_data['css'] = extract_css(soup, url)
+    if options.extract_images:
+        site_data['images'] = extract_images(soup, url)
+    if options.extract_links:
+        site_data['links'] = extract_links(soup, url)
+    
+    if site_data:
+        result['site'] = site_data
+    
+    # Video Grabber
+    if options.extract_youtube or options.extract_vimeo or options.extract_all_videos:
+        result['videos'] = extract_videos(soup, html, options)
+    
+    # Save to database
+    scrape_id = str(uuid.uuid4())
+    await db.scrapes.insert_one({
+        'scrape_id': scrape_id,
+        'url': url,
+        'options': options.dict(),
+        'result': result,
+        'created_at': datetime.utcnow()
+    })
+    
+    result['scrape_id'] = scrape_id
+    
+    return result
+
+# ========== SESSION ENDPOINTS ==========
 
 @api_router.post("/session/start")
-async def start_session(request: StartSessionRequest):
-    session = ScrapeSession(name=request.name or f"Session {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}", webhook_url=request.webhook_url)
-    await db.sessions.insert_one(session.dict())
-    return {"success": True, "session_id": session.session_id, "name": session.name, "message": "Session started. You can now scrape multiple pages."}
+async def start_session(request: SessionRequest):
+    """Start a new scraping session"""
+    session_id = str(uuid.uuid4())
+    session = {
+        'session_id': session_id,
+        'name': request.name or f"Session {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
+        'pages': [],
+        'total_pages': 0,
+        'created_at': datetime.utcnow(),
+        'status': 'active'
+    }
+    
+    await db.sessions.insert_one(session)
+    
+    return {
+        'success': True,
+        'session_id': session_id,
+        'name': session['name']
+    }
 
 @api_router.post("/session/scrape")
-async def scrape_to_session(request: ScrapePageRequest):
-    session = await db.sessions.find_one({"session_id": request.session_id})
+async def scrape_to_session(request: ScrapeRequest):
+    """Scrape a page and add to session"""
+    
+    if not request.session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    
+    # Check session exists
+    session = await db.sessions.find_one({'session_id': request.session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    if session.get('status') == 'completed':
-        raise HTTPException(status_code=400, detail="Session already completed")
-    scraped_data = await scrape_url(request.url, request.mode)
-    page = ScrapedPage(url=request.url, title=scraped_data.get('title'), html=scraped_data.get('html'), css=scraped_data.get('css'), text=scraped_data.get('text'), images=scraped_data.get('images', []), links=[l['url'] for l in scraped_data.get('links', [])], scripts=[s.get('url') or 'inline' for s in scraped_data.get('scripts', [])], mode=request.mode.dict())
-    await db.sessions.update_one({"session_id": request.session_id}, {"$push": {"pages": page.dict()}, "$inc": {"total_pages": 1}, "$set": {"updated_at": datetime.utcnow()}})
-    return {"success": True, "session_id": request.session_id, "page_id": page.page_id, "url": request.url, "title": page.title, "scraped": {"has_html": bool(page.html), "has_css": bool(page.css), "has_text": bool(page.text), "image_count": len(page.images), "link_count": len(page.links)}, "message": f"Page scraped and added to session"}
+    
+    # Scrape the page
+    scrape_result = await scrape_url(request)
+    
+    # Add to session
+    page_data = {
+        'page_id': scrape_result.get('scrape_id'),
+        'url': request.url,
+        'title': scrape_result.get('title'),
+        'data': scrape_result,
+        'scraped_at': datetime.utcnow()
+    }
+    
+    await db.sessions.update_one(
+        {'session_id': request.session_id},
+        {
+            '$push': {'pages': page_data},
+            '$inc': {'total_pages': 1},
+            '$set': {'updated_at': datetime.utcnow()}
+        }
+    )
+    
+    return {
+        'success': True,
+        'session_id': request.session_id,
+        'page': page_data,
+        'scrape_result': scrape_result
+    }
 
 @api_router.get("/session/{session_id}")
 async def get_session(session_id: str):
-    session = await db.sessions.find_one({"session_id": session_id})
+    """Get session data"""
+    session = await db.sessions.find_one({'session_id': session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     session.pop('_id', None)
     return session
 
-@api_router.get("/session/{session_id}/summary")
-async def get_session_summary(session_id: str):
-    session = await db.sessions.find_one({"session_id": session_id})
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    pages_summary = []
-    for page in session.get('pages', []):
-        pages_summary.append({'page_id': page.get('page_id'), 'url': page.get('url'), 'title': page.get('title'), 'image_count': len(page.get('images', [])), 'link_count': len(page.get('links', [])), 'has_html': bool(page.get('html')), 'has_css': bool(page.get('css')), 'scraped_at': page.get('scraped_at')})
-    return {'session_id': session_id, 'name': session.get('name'), 'status': session.get('status'), 'total_pages': session.get('total_pages', 0), 'pages': pages_summary, 'created_at': session.get('created_at'), 'updated_at': session.get('updated_at')}
-
 @api_router.delete("/session/{session_id}/page/{page_id}")
-async def remove_page_from_session(session_id: str, page_id: str):
-    result = await db.sessions.update_one({"session_id": session_id}, {"$pull": {"pages": {"page_id": page_id}}, "$inc": {"total_pages": -1}, "$set": {"updated_at": datetime.utcnow()}})
+async def delete_page(session_id: str, page_id: str):
+    """Remove a page from session"""
+    result = await db.sessions.update_one(
+        {'session_id': session_id},
+        {
+            '$pull': {'pages': {'page_id': page_id}},
+            '$inc': {'total_pages': -1}
+        }
+    )
     if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Session or page not found")
-    return {"success": True, "message": "Page removed from session"}
+        raise HTTPException(status_code=404, detail="Page not found")
+    return {'success': True}
 
 @api_router.post("/session/complete")
 async def complete_session(request: CompleteSessionRequest):
-    session = await db.sessions.find_one({"session_id": request.session_id})
+    """Complete session and optionally send to webhook"""
+    
+    session = await db.sessions.find_one({'session_id': request.session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    webhook_url = request.webhook_url or session.get('webhook_url')
+    
     session.pop('_id', None)
-    session_data = {'session_id': session['session_id'], 'name': session.get('name'), 'total_pages': session.get('total_pages', 0), 'pages': session.get('pages', []), 'created_at': str(session.get('created_at')), 'completed_at': str(datetime.utcnow())}
-    await db.sessions.update_one({"session_id": request.session_id}, {"$set": {"status": "completed", "completed_at": datetime.utcnow()}})
+    
+    # Update status
+    await db.sessions.update_one(
+        {'session_id': request.session_id},
+        {'$set': {'status': 'completed', 'completed_at': datetime.utcnow()}}
+    )
+    
+    # Send to webhook if provided
     webhook_result = None
-    if webhook_url:
+    if request.webhook_url:
         try:
             async with httpx.AsyncClient(timeout=30.0) as http_client:
-                response = await http_client.post(webhook_url, json=session_data, headers={'Content-Type': 'application/json'})
-                webhook_result = {'sent': True, 'status_code': response.status_code, 'response': response.text[:500] if response.text else None}
-                await db.sessions.update_one({"session_id": request.session_id}, {"$set": {"webhook_sent": True, "status": "sent"}})
+                response = await http_client.post(
+                    request.webhook_url,
+                    json=session,
+                    headers={'Content-Type': 'application/json'}
+                )
+                webhook_result = {
+                    'sent': True,
+                    'status_code': response.status_code
+                }
         except Exception as e:
             webhook_result = {'sent': False, 'error': str(e)}
-    return {'success': True, 'session_id': request.session_id, 'total_pages': session_data['total_pages'], 'webhook': webhook_result, 'data': session_data, 'message': 'Session completed!' + (' Data sent to webhook.' if webhook_result and webhook_result.get('sent') else '')}
+    
+    return {
+        'success': True,
+        'session': session,
+        'webhook': webhook_result
+    }
 
-@api_router.get("/sessions")
-async def list_sessions(limit: int = 20, status: Optional[str] = None):
-    query = {}
-    if status:
-        query['status'] = status
-    sessions = await db.sessions.find(query).sort("created_at", -1).limit(limit).to_list(limit)
-    result = []
-    for session in sessions:
-        session.pop('_id', None)
-        session['pages'] = len(session.get('pages', []))
-        result.append(session)
-    return {'sessions': result, 'count': len(result)}
+# ========== BROWSERLESS EMBED ==========
 
-@api_router.post("/scrape/quick")
-async def quick_scrape(request: WebScrapeRequest):
-    scraped_data = await scrape_url(request.url, request.mode)
-    scrape_id = str(uuid.uuid4())
-    await db.quick_scrapes.insert_one({'scrape_id': scrape_id, 'url': request.url, 'data': scraped_data, 'created_at': datetime.utcnow()})
-    return {'success': True, 'scrape_id': scrape_id, 'data': scraped_data}
+@api_router.get("/browser/embed")
+async def get_browser_embed():
+    """Get Browserless embed URL for live browser"""
+    
+    # Browserless live view URL
+    embed_url = f"https://chrome.browserless.io/?token={BROWSERLESS_API_KEY}"
+    
+    return {
+        'embed_url': embed_url,
+        'api_key': BROWSERLESS_API_KEY[:10] + '...'  # Partial for security
+    }
+
+# ========== PROXY ENDPOINT ==========
 
 @api_router.get("/proxy")
 async def proxy_website(url: str):
+    """Proxy a website for iframe display"""
     if not url:
-        raise HTTPException(status_code=400, detail="URL parameter is required")
+        raise HTTPException(status_code=400, detail="URL required")
+    
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http_client:
-            response = await http_client.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
+            response = await http_client.get(url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+        
         content_type = response.headers.get('content-type', 'text/html')
         content = response.content
+        
         if 'text/html' in content_type:
             soup = BeautifulSoup(response.text, 'html.parser')
             base_tag = soup.new_tag('base', href=url)
             if soup.head:
                 soup.head.insert(0, base_tag)
-            elif soup.html:
-                head = soup.new_tag('head')
-                head.append(base_tag)
-                soup.html.insert(0, head)
             content = str(soup).encode('utf-8')
-        return Response(content=content, status_code=response.status_code, media_type=content_type, headers={'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': '*', 'Access-Control-Allow-Headers': '*'})
+        
+        return Response(
+            content=content,
+            status_code=response.status_code,
+            media_type=content_type,
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': '*',
+                'Access-Control-Allow-Headers': '*',
+            }
+        )
     except Exception as e:
-        logging.error(f"Proxy error for {url}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to proxy URL: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-class LegacyScrapeOptions(BaseModel):
-    clone_page: bool = True
-    clone_entire_site: bool = False
-    deep_scrape: bool = False
-    include_images: bool = True
-    include_css: bool = True
-    include_javascript: bool = False
-    follow_external_links: bool = False
-    max_pages: int = 50
-
-class LegacyWebScrapeRequest(BaseModel):
-    url: str
-    options: Optional[LegacyScrapeOptions] = LegacyScrapeOptions()
-    convert_images_to_base64: bool = False
-
-@api_router.post("/scrape/web")
-async def legacy_scrape_from_web(request: LegacyWebScrapeRequest):
-    mode = ScrapeMode(html=True, css=request.options.include_css, images=request.options.include_images, links=True, scripts=request.options.include_javascript)
-    scraped_data = await scrape_url(request.url, mode)
-    scrape_id = str(uuid.uuid4())
-    await db.web_scrapes.insert_one({'scrape_id': scrape_id, 'url': request.url, 'data': scraped_data, 'created_at': datetime.utcnow()})
-    return {'success': True, 'data': scraped_data, 'message': 'URL scraped successfully', 'scrape_id': scrape_id}
+# ========== ROOT ==========
 
 @api_router.get("/")
 async def root():
-    return {"message": "Web Scraper API", "version": "2.0.0", "endpoints": {"proxy": "GET /api/proxy?url=<url>", "start_session": "POST /api/session/start", "scrape_page": "POST /api/session/scrape", "get_session": "GET /api/session/<id>", "complete_session": "POST /api/session/complete", "quick_scrape": "POST /api/scrape/quick"}}
+    return {
+        "message": "Marketing Scraper API",
+        "version": "3.0.0",
+        "features": [
+            "Lead Scraper (emails, phones, names, companies, social)",
+            "Site Cloner (HTML, CSS, images, links)",
+            "Video Grabber (YouTube, Vimeo, all videos)",
+            "Session management",
+            "Browserless.io integration"
+        ]
+    }
 
 @app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+async def health():
+    return {"status": "healthy"}
 
 app.include_router(api_router)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+
+logging.basicConfig(level=logging.INFO)
 
 @app.on_event("startup")
-async def startup_event():
-    logger.info("Starting Web Scraper API v2.0.0")
+async def startup():
+    logging.info("Starting Marketing Scraper API v3.0.0")
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
+@app.on_event("shutdown") 
+async def shutdown():
     client.close()
