@@ -1,6 +1,7 @@
 from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import Response
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
@@ -106,8 +107,8 @@ class WebScrapeResponse(BaseModel):
 async def scrape_url_simple(url: str, include_images: bool = True) -> Dict[str, Any]:
     """Scrape a URL using simple HTTP request + BeautifulSoup"""
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            response = await client.get(url, headers={
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http_client:
+            response = await http_client.get(url, headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
             response.raise_for_status()
@@ -228,6 +229,62 @@ async def list_web_scrapes(limit: int = 50):
         scrape.pop('_id', None)
     
     return {"scrapes": scrapes, "count": len(scrapes)}
+
+# ========== PROXY ENDPOINT ==========
+@api_router.get("/proxy")
+async def proxy_website(url: str):
+    """
+    Proxy a website and remove iframe-blocking headers.
+    This allows ANY website to be embedded in an iframe.
+    
+    Usage: /api/proxy?url=https://example.com
+    """
+    if not url:
+        raise HTTPException(status_code=400, detail="URL parameter is required")
+    
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http_client:
+            response = await http_client.get(url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            })
+        
+        # Get content type
+        content_type = response.headers.get('content-type', 'text/html')
+        
+        # For HTML content, rewrite relative URLs to absolute
+        content = response.content
+        if 'text/html' in content_type:
+            html_text = response.text
+            
+            # Parse and fix relative URLs
+            soup = BeautifulSoup(html_text, 'html.parser')
+            
+            # Add base tag to fix relative URLs
+            base_tag = soup.new_tag('base', href=url)
+            if soup.head:
+                soup.head.insert(0, base_tag)
+            elif soup.html:
+                head = soup.new_tag('head')
+                head.append(base_tag)
+                soup.html.insert(0, head)
+            
+            content = str(soup).encode('utf-8')
+        
+        # Return response WITHOUT iframe-blocking headers
+        return Response(
+            content=content,
+            status_code=response.status_code,
+            media_type=content_type,
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': '*',
+                'Access-Control-Allow-Headers': '*',
+            }
+        )
+    except Exception as e:
+        logging.error(f"Proxy error for {url}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to proxy URL: {str(e)}")
+# ========== END PROXY ENDPOINT ==========
 
 # Health check
 @app.get("/health")
